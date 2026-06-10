@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <hip/hip_fp8.h>
+
 #include <type_traits>
 
 #include "gpu_iface/mma_types.hpp"
@@ -11,7 +13,12 @@
 namespace {
 using f16 = _Float16;
 using f16x4 = f16 __attribute__((ext_vector_type(4)));
+using f16x8 = f16 __attribute__((ext_vector_type(8)));
 using f32x4 = float __attribute__((ext_vector_type(4)));
+using f32x8 = float __attribute__((ext_vector_type(8)));
+using bf16x4 = short __attribute__((ext_vector_type(4)));
+using bf16x8 = short __attribute__((ext_vector_type(8)));
+using i32x2 = int __attribute__((ext_vector_type(2)));
 
 }  // namespace
 
@@ -21,6 +28,79 @@ namespace mma_impl {
 namespace hip {
 
 #define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
+
+#if HIP_FP8_CVT_FAST_PATH && !HIP_FP8_TYPE_FNUZ
+__device__ __forceinline__ float fp8_e4m3_fnuz_to_float(uint8_t x) {
+  if (x == 0x80u) {
+    float nan;
+    uint32_t nan_bits = 0x7FC00000u;
+    __builtin_memcpy(&nan, &nan_bits, sizeof(float));
+    return nan;
+  }
+  uint32_t sign = (uint32_t)(x >> 7) & 1u;
+  uint32_t exp8 = (uint32_t)(x >> 3) & 0xFu;
+  uint32_t mant8 = (uint32_t)(x) & 0x7u;
+  uint32_t f32;
+  if (exp8 == 0u) {
+    if (mant8 == 0u) {
+      f32 = sign << 31u;
+    } else {
+      uint32_t p = 31u - __builtin_clz(mant8);
+      f32 = (sign << 31u) | ((p + 117u) << 23u) | ((mant8 ^ (1u << p)) << (23u - p));
+    }
+  } else {
+    f32 = (sign << 31u) | ((exp8 + 119u) << 23u) | (mant8 << 20u);
+  }
+  float result;
+  __builtin_memcpy(&result, &f32, sizeof(float));
+  return result;
+}
+
+__device__ __forceinline__ float fp8_e5m2_fnuz_to_float(uint8_t x) {
+  if (x == 0x80u) {
+    float nan;
+    uint32_t nan_bits = 0x7FC00000u;
+    __builtin_memcpy(&nan, &nan_bits, sizeof(float));
+    return nan;
+  }
+  uint32_t sign = (uint32_t)(x >> 7) & 1u;
+  uint32_t exp8 = (uint32_t)(x >> 2) & 0x1Fu;
+  uint32_t mant8 = (uint32_t)(x) & 0x3u;
+  uint32_t f32;
+  if (exp8 == 0u) {
+    if (mant8 == 0u) {
+      f32 = sign << 31u;
+    } else {
+      uint32_t p = 31u - __builtin_clz(mant8);
+      f32 = (sign << 31u) | ((p + 110u) << 23u) | ((mant8 ^ (1u << p)) << (23u - p));
+    }
+  } else {
+    f32 = (sign << 31u) | ((exp8 + 111u) << 23u) | (mant8 << 21u);
+  }
+  float result;
+  __builtin_memcpy(&result, &f32, sizeof(float));
+  return result;
+}
+#endif
+
+template <typename T>
+__device__ __forceinline__ float fp8_to_float(T value) {
+  if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz>) {
+#if HIP_FP8_CVT_FAST_PATH && !HIP_FP8_TYPE_FNUZ
+    return fp8_e4m3_fnuz_to_float(value.__x);
+#else
+    return static_cast<float>(value);
+#endif
+  } else if constexpr (std::is_same_v<T, __hip_fp8_e5m2_fnuz>) {
+#if HIP_FP8_CVT_FAST_PATH && !HIP_FP8_TYPE_FNUZ
+    return fp8_e5m2_fnuz_to_float(value.__x);
+#else
+    return static_cast<float>(value);
+#endif
+  } else {
+    return static_cast<float>(value);
+  }
+}
 
 /// @brief Transposes a 4x4 matrix of `half` values held across a quad of 4 threads.
 /// @details This function operates on a group of 4 consecutive threads (a quad). It assumes
@@ -43,7 +123,7 @@ namespace hip {
 ///          *within* each 4x4 data block.
 __device__ __forceinline__ void transpose_intra_quad_fragments(uint32_t* R) {
   // Calculate lane within 4-thread group
-  uint32_t lane_id = threadIdx.x % 64;
+  uint32_t lane_id = threadIdx.x % 32;
   uint32_t lane_in_group = lane_id % 4;
 
   // === ROUND 1: Exchange with neighbor (XOR with 1) ===
@@ -99,7 +179,7 @@ __device__ __forceinline__ void transpose_intra_quad_fragments(uint32_t* R) {
 /// @note    This function can be combined with `transpose_intra_quad_fragments` (which transposes
 ///          the data *within* each fragment) to perform a full 16x16 in-register matrix transpose.
 __device__ __forceinline__ void transpose_inter_quad_fragments(uint32_t* R) {
-  uint32_t lane_id = threadIdx.x % 64;
+  uint32_t lane_id = threadIdx.x % 32;
 
   uint32_t block_row = (lane_id % 16) / 4;
   uint32_t block_col = (lane_id / 16);
@@ -108,8 +188,8 @@ __device__ __forceinline__ void transpose_inter_quad_fragments(uint32_t* R) {
   uint32_t xor_mask = lane_id ^ partner_lane_id;
 
   // Exchange both registers with the partner thread
-  R[0] = __shfl_xor(R[0], xor_mask, 64);
-  R[1] = __shfl_xor(R[1], xor_mask, 64);
+  R[0] = __shfl_xor(R[0], xor_mask, 32);
+  R[1] = __shfl_xor(R[1], xor_mask, 32);
 }
 
 /// @brief Performs a full 16x16 in-register matrix transpose by combining intra-quad and
@@ -143,7 +223,30 @@ __device__ __forceinline__ void load_fragment(uint32_t* R, const T* smem_ptr) {
 template <typename T, mma::MMAMode mma_mode = mma::MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
                                                                      uint32_t* B) {
-#if defined(__HIP_DEVICE_COMPILE__) && (__gfx90a__ || __gfx908__ || __gfx942__ || __gfx950__)
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  static_assert(std::is_same_v<T, __half> || std::is_same_v<T, __hip_bfloat16>,
+                "T must be __half or __hip_bfloat16");
+
+  if constexpr (mma_mode == mma::MMAMode::kInit) {
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      C[i] = 0.0f;
+    }
+  }
+
+  f32x8 C_fp32 = reinterpret_cast<f32x8*>(C)[0];
+  if constexpr (std::is_same_v<T, __half>) {
+    f16x8 A_fp16 = reinterpret_cast<f16x8*>(A)[0];
+    f16x8 B_fp16 = reinterpret_cast<f16x8*>(B)[0];
+    C_fp32 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(A_fp16, B_fp16, C_fp32);
+  } else if constexpr (std::is_same_v<T, __hip_bfloat16>) {
+    bf16x8 A_bf16 = reinterpret_cast<bf16x8*>(A)[0];
+    bf16x8 B_bf16 = reinterpret_cast<bf16x8*>(B)[0];
+    C_fp32 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(A_bf16, B_bf16, C_fp32);
+  }
+
+  reinterpret_cast<f32x8*>(C)[0] = C_fp32;
+#elif defined(__HIP_DEVICE_COMPILE__) && (__gfx90a__ || __gfx908__ || __gfx942__ || __gfx950__)
   // Ensure T is either __half or __hip_bfloat16
   static_assert(std::is_same_v<T, __half> || std::is_same_v<T, __hip_bfloat16>,
                 "T must be __half or __hip_bfloat16");
@@ -168,7 +271,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
 
   reinterpret_cast<f32x4*>(C)[0] = C_fp32;
 #elif defined(__HIP_DEVICE_COMPILE__)
-#error "Unsupported GFX platform for MFMA ops."
+#error "Unsupported GFX platform for HIP MMA ops."
 #endif
 }
 
@@ -211,10 +314,25 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag)
   static_assert(std::is_same_v<DType, __half> || std::is_same_v<DType, __hip_bfloat16>,
                 "DType must be __half or __hip_bfloat16");
 
-  f16x4 a = reinterpret_cast<const f16x4*>(s_frag)[0];
   f32x4 c = {d[0], d[1], d[2], d[3]};
   f32x4 out;
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  if constexpr (std::is_same_v<DType, __half>) {
+    d[0] += __half2float(s_frag[0]) + __half2float(s_frag[1]) + __half2float(s_frag[4]) +
+      __half2float(s_frag[5]);
+    d[1] += __half2float(s_frag[2]) + __half2float(s_frag[3]) + __half2float(s_frag[6]) +
+      __half2float(s_frag[7]);
+    return;
+  } else if constexpr (std::is_same_v<DType, __hip_bfloat16>) {
+    d[0] += static_cast<float>(s_frag[0]) + static_cast<float>(s_frag[1]) +
+      static_cast<float>(s_frag[4]) + static_cast<float>(s_frag[5]);
+    d[1] += static_cast<float>(s_frag[2]) + static_cast<float>(s_frag[3]) +
+      static_cast<float>(s_frag[6]) + static_cast<float>(s_frag[7]);
+    return;
+  }
+#elif defined(__HIP_DEVICE_COMPILE__)
+  f16x4 a = reinterpret_cast<const f16x4*>(s_frag)[0];
   if constexpr (std::is_same_v<DType, __half>) {
     f16x4 b = {f16(1.0f), f16(1.0f), f16(1.0f), f16(1.0f)};
     out = __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, c, 0, 0, 0);
@@ -226,6 +344,7 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag)
     __builtin_memcpy(&b, &bf16_ones, sizeof(f16x4));
     out = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
   }
+#endif
 
   d[0] = out.x;
   d[1] = out.y;
@@ -233,17 +352,55 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag)
   d[3] = out.w;
 }
 
-// TODO (rimaddur) : After release 2025.08
-// FP8 operations - not implemented for MI300 yet
-template <typename T>
+template <typename T, mma::MMAMode mma_mode = mma::MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* c_frag, T* a_frag,
                                                                    T* b_frag) {
-  FLASHINFER_RUNTIME_ASSERT("FP8 MMA not implemented for AMD");
+  static_assert(sizeof(T) == 1, "DType must be 8-bit floating data type");
+
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  if constexpr (mma_mode == mma::MMAMode::kInit) {
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      c_frag[i] = 0.0f;
+    }
+  }
+
+  i32x2* a_i32 = reinterpret_cast<i32x2*>(a_frag);
+  i32x2* b_i32 = reinterpret_cast<i32x2*>(b_frag);
+  f32x8 c = reinterpret_cast<f32x8*>(c_frag)[0];
+
+  if constexpr (std::is_same_v<T, __hip_fp8_e4m3_fnuz> || std::is_same_v<T, __hip_fp8_e4m3>) {
+    c = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_i32[0], b_i32[0], c);
+    c = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_i32[1], b_i32[1], c);
+  } else if constexpr (std::is_same_v<T, __hip_fp8_e5m2_fnuz> || std::is_same_v<T, __hip_fp8_e5m2>) {
+    c = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_i32[0], b_i32[0], c);
+    c = __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12(a_i32[1], b_i32[1], c);
+  } else {
+    FLASHINFER_RUNTIME_ASSERT("Unsupported AMD FP8 MMA dtype");
+  }
+
+  reinterpret_cast<f32x8*>(c_frag)[0] = c;
+#elif defined(__HIP_DEVICE_COMPILE__)
+  FLASHINFER_RUNTIME_ASSERT("FP8 MMA is implemented for AMD gfx1201 WMMA only");
+#endif
 }
 
 template <typename DType>
 __device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d_frag, DType* s_frag) {
-  FLASHINFER_RUNTIME_ASSERT("FP8 rowsum not implemented for AMD");
+  static_assert(sizeof(DType) == 1, "DType must be 8-bit floating data type");
+
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  d_frag[0] += fp8_to_float(s_frag[0]) + fp8_to_float(s_frag[1]) +
+               fp8_to_float(s_frag[4]) + fp8_to_float(s_frag[5]) +
+               fp8_to_float(s_frag[8]) + fp8_to_float(s_frag[9]) +
+               fp8_to_float(s_frag[12]) + fp8_to_float(s_frag[13]);
+  d_frag[1] += fp8_to_float(s_frag[2]) + fp8_to_float(s_frag[3]) +
+               fp8_to_float(s_frag[6]) + fp8_to_float(s_frag[7]) +
+               fp8_to_float(s_frag[10]) + fp8_to_float(s_frag[11]) +
+               fp8_to_float(s_frag[14]) + fp8_to_float(s_frag[15]);
+#elif defined(__HIP_DEVICE_COMPILE__)
+  FLASHINFER_RUNTIME_ASSERT("FP8 rowsum is implemented for AMD gfx1201 only");
+#endif
 }
 
 }  // namespace hip

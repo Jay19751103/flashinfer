@@ -145,7 +145,7 @@ elif IS_HIP:
 
         try:
             validate_flashinfer_rocm_arch(
-                arch_list=None,  # Uses FLASHINFER_ROCM_ARCH_LIST env or defaults to gfx942
+                arch_list=None,  # Uses env/current device before falling back.
                 torch_cpp_ext_module=torch_cpp_ext,
                 verbose=False,
             )

@@ -91,7 +91,8 @@ class CompilationContext:
         Returns:
             List of flags like ["--offload-arch=gfx942", "--offload-arch=gfx90a", ...]
         """
-        return self.arch_flags + self.COMMON_HIPCC_FLAGS
+        flags = self.arch_flags + self.COMMON_HIPCC_FLAGS
+        return flags
 
     def get_target_archs(self) -> set[str]:
         """

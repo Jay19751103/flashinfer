@@ -13,7 +13,11 @@ namespace gpu_iface {
 constexpr int kWarpSize = 32;
 
 #elif defined(PLATFORM_HIP_DEVICE)
+#if defined(__gfx1201__)
+constexpr int kWarpSize = 32;
+#else
 constexpr int kWarpSize = 64;
+#endif
 
 #endif
 

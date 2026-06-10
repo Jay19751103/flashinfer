@@ -5,7 +5,7 @@
 import functools
 
 # AMDGPU archs supported by amd-flashinfer
-FLASHINFER_SUPPORTED_ROCM_ARCHS = ["gfx942", "gfx950"]
+FLASHINFER_SUPPORTED_ROCM_ARCHS = ["gfx942", "gfx950", "gfx1201"]
 
 
 def get_rocm_home():
@@ -312,9 +312,26 @@ def validate_flashinfer_rocm_arch(
     """
     import os
 
-    # Get architecture list from parameter, env var, or default
+    # Get architecture list from parameter, env var, current device, or default.
     if arch_list is None:
-        arch_list = os.environ.get("FLASHINFER_ROCM_ARCH_LIST", "gfx942")
+        arch_list = os.environ.get("FLASHINFER_ROCM_ARCH_LIST")
+    if arch_list is None:
+        try:
+            import torch
+
+            detected_archs = {
+                torch.cuda.get_device_properties(i).gcnArchName.split(":")[0]
+                for i in range(torch.cuda.device_count())
+            }
+            detected_archs = {
+                arch for arch in detected_archs if arch in FLASHINFER_SUPPORTED_ROCM_ARCHS
+            }
+            if detected_archs:
+                arch_list = ",".join(sorted(detected_archs))
+        except Exception:
+            pass
+    if arch_list is None:
+        arch_list = "gfx942"
 
     # Step 1: Validate against system ROCm version (reuse existing logic)
     validated_arch_list = validate_rocm_arch(arch_list=arch_list, verbose=verbose)
