@@ -199,15 +199,51 @@ __device__ __forceinline__ void transpose_inter_quad_fragments(uint32_t* R) {
 ///          transpose_intra_quad_fragments and transpose_inter_quad_fragments to fully transpose a
 ///          16x16 tile distributed across 64 threads.
 ///
-///          Use cases:
-///          - B→A layout: Convert column slices to row slices (e.g., for rowsum where S must be
-///          A-matrix)
-///          - A→B layout: Convert row slices to column slices (if needed for other operations)
+///          For gfx1201 (RDNA4, wave32): WMMA D-output layout:
+///            thread t, reg j → D[j*2 + (t/16)][t%16]
+///          WMMA A-matrix input layout:
+///            thread t, reg k → A[t%16][(t/16)*8 + k]
+///          Transpose D→A means rearranging so that A[col_D][row_D] is held correctly.
+///          Each group needs its own partial rows interleaved with the partner group's data
+///          via __shfl_xor(R, 16).
 ///
-/// @param R Pointer to 2 uint32_t registers containing the fragment data
+/// @param R Pointer to fragment registers (2 uint32 on CDNA3, 4 uint32 on gfx1201)
 __device__ __forceinline__ void transpose_mma_tile(uint32_t* R) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  // WMMA wave32 D→A transpose.
+  // D-matrix: thread t, R[j] (as f16 pair) = {D[j*2+1][(t%16)], D[j*2][(t%16)]} for t/16=0 (even rows)
+  //                                          {D[j*2+1][(t%16)], D[j*2][(t%16)]} for t/16=1 (odd rows)
+  // More precisely: group 0 (t/16=0): s_frag[j] = D[j*2][t%16], packed as R[j/2].{lo,hi}
+  //                 group 1 (t/16=1): s_frag[j] = D[j*2+1][t%16], packed as R[j/2].{lo,hi}
+  //
+  // A-matrix target: group 0 → A[t%16][0..7], group 1 → A[t%16][8..15]
+  //   R_A[i] = { A[t%16][(t/16)*8 + 2i + 1],  A[t%16][(t/16)*8 + 2i] }
+  //
+  // Construction:
+  //   Group 0 uses own R[0..1] (even rows) and partner's R[0..1] (odd rows from g1)
+  //   Group 1 uses partner's R[2..3] (even rows from g0) and own R[2..3] (odd rows)
+  const uint32_t lane_grp = (threadIdx.x % 32) / 16;  // 0 or 1
+  const uint32_t src_idx = lane_grp * 2;               // 0 for g0, 2 for g1
+
+  // Fetch partner's source registers
+  const uint32_t s0 = R[src_idx],      s1 = R[src_idx + 1];
+  const uint32_t p0 = __shfl_xor(s0, 16, 32), p1 = __shfl_xor(s1, 16, 32);
+
+  // even_src = data from group 0 (even D rows), odd_src = data from group 1 (odd D rows)
+  const uint32_t even0 = (lane_grp == 0) ? s0 : p0;
+  const uint32_t odd0  = (lane_grp == 0) ? p0 : s0;
+  const uint32_t even1 = (lane_grp == 0) ? s1 : p1;
+  const uint32_t odd1  = (lane_grp == 0) ? p1 : s1;
+
+  // Interleave even/odd 16-bit halves: R_A[i] = {odd.lo<<16 | even.lo}
+  R[0] = (even0 & 0xFFFFu) | ((odd0 & 0xFFFFu) << 16);
+  R[1] = (even0 >> 16)     | ((odd0 >> 16)      << 16);
+  R[2] = (even1 & 0xFFFFu) | ((odd1 & 0xFFFFu) << 16);
+  R[3] = (even1 >> 16)     | ((odd1 >> 16)      << 16);
+#else
   transpose_intra_quad_fragments(R);
   transpose_inter_quad_fragments(R);
+#endif
 }
 
 // Single unified load function for all fragment types
@@ -314,24 +350,33 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag)
   static_assert(std::is_same_v<DType, __half> || std::is_same_v<DType, __hip_bfloat16>,
                 "DType must be __half or __hip_bfloat16");
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  // WMMA wave32: after transpose_mma_tile, s_frag is in A-matrix layout.
+  // Use WMMA(A, ones, C) to compute row sums. C/D layout has 8 outputs per thread.
+  f32x8 c = reinterpret_cast<f32x8*>(d)[0];
+  f32x8 out;
+  if constexpr (std::is_same_v<DType, __half>) {
+    // B = all-ones 16x16 f16 matrix (packed into 4 uint32 = 8 f16)
+    constexpr uint32_t fp16_one_pair = 0x3C003C00u;  // two f16 1.0 values
+    f16x8 b;
+    uint32_t* b_ptr = reinterpret_cast<uint32_t*>(&b);
+    b_ptr[0] = fp16_one_pair; b_ptr[1] = fp16_one_pair;
+    b_ptr[2] = fp16_one_pair; b_ptr[3] = fp16_one_pair;
+    f16x8 a = reinterpret_cast<f16x8*>(s_frag)[0];
+    out = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+  } else if constexpr (std::is_same_v<DType, __hip_bfloat16>) {
+    constexpr uint32_t bf16_one_pair = 0x3F803F80u;  // two bf16 1.0 values
+    bf16x8 b;
+    uint32_t* b_ptr = reinterpret_cast<uint32_t*>(&b);
+    b_ptr[0] = bf16_one_pair; b_ptr[1] = bf16_one_pair;
+    b_ptr[2] = bf16_one_pair; b_ptr[3] = bf16_one_pair;
+    bf16x8 a = reinterpret_cast<bf16x8*>(s_frag)[0];
+    out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+  }
+  reinterpret_cast<f32x8*>(d)[0] = out;
+#elif defined(__HIP_DEVICE_COMPILE__)
   f32x4 c = {d[0], d[1], d[2], d[3]};
   f32x4 out;
-
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
-  if constexpr (std::is_same_v<DType, __half>) {
-    d[0] += __half2float(s_frag[0]) + __half2float(s_frag[1]) + __half2float(s_frag[4]) +
-      __half2float(s_frag[5]);
-    d[1] += __half2float(s_frag[2]) + __half2float(s_frag[3]) + __half2float(s_frag[6]) +
-      __half2float(s_frag[7]);
-    return;
-  } else if constexpr (std::is_same_v<DType, __hip_bfloat16>) {
-    d[0] += static_cast<float>(s_frag[0]) + static_cast<float>(s_frag[1]) +
-      static_cast<float>(s_frag[4]) + static_cast<float>(s_frag[5]);
-    d[1] += static_cast<float>(s_frag[2]) + static_cast<float>(s_frag[3]) +
-      static_cast<float>(s_frag[6]) + static_cast<float>(s_frag[7]);
-    return;
-  }
-#elif defined(__HIP_DEVICE_COMPILE__)
   f16x4 a = reinterpret_cast<const f16x4*>(s_frag)[0];
   if constexpr (std::is_same_v<DType, __half>) {
     f16x4 b = {f16(1.0f), f16(1.0f), f16(1.0f), f16(1.0f)};
@@ -344,12 +389,11 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag)
     __builtin_memcpy(&b, &bf16_ones, sizeof(f16x4));
     out = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
   }
-#endif
-
   d[0] = out.x;
   d[1] = out.y;
   d[2] = out.z;
   d[3] = out.w;
+#endif
 }
 
 template <typename T, mma::MMAMode mma_mode = mma::MMAMode::kInplaceUpdate>

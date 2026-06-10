@@ -155,16 +155,28 @@ struct smem_t {
   static __device__ __forceinline__ uint32_t advance_offset_by_row(uint32_t offset,
                                                                    uint32_t row_idx = 0) {
     if constexpr (swizzle_mode == SwizzleMode::k128B) {
-      static_assert(step_size == 4 || step_size % 8 == 0, "Unsupported step size");
-      if constexpr (step_size == 4) {
+      static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0, "Unsupported step size");
+      if constexpr (step_size == 2) {
+        // (i+2)%8 ^ i%8 alternates 2/6 every 2 rows.
+        const uint32_t xor_mask = 0x2u | (0x4u * ((row_idx / 2u) % 2u));
+        return (offset ^ xor_mask) + step_size * row_stride;
+      } else if constexpr (step_size == 4) {
         return (offset ^ 0x4) + step_size * row_stride;
       } else {
         // step_size % 8 == 0
         return offset + step_size * row_stride;
       }
     } else if constexpr (swizzle_mode == SwizzleMode::k128B_16Row) {
-      static_assert(step_size == 4 || step_size % 8 == 0, "Unsupported step size");
-      if constexpr (step_size == 4) {
+      static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0, "Unsupported step size");
+      if constexpr (step_size == 2) {
+        if constexpr (row_stride >= 16u) {
+          const uint32_t xor_mask = ((row_idx + 2u) % 16u) ^ (row_idx % 16u);
+          return (offset ^ xor_mask) + step_size * row_stride;
+        } else {
+          const uint32_t xor_mask = 0x2u | (0x4u * ((row_idx / 2u) % 2u));
+          return (offset ^ xor_mask) + step_size * row_stride;
+        }
+      } else if constexpr (step_size == 4) {
         // Use the same period as get_permuted_offset: period=16 when row_stride>=16,
         // period=8 otherwise.  For period-16: (i+4)%16 ^ i%16 alternates between 4
         // and 12 every 4 rows.  For period-8 (fallback): (i+4)%8 ^ i%8 = 4 always.
@@ -179,8 +191,12 @@ struct smem_t {
         return offset + step_size * row_stride;
       }
     } else if constexpr (swizzle_mode == SwizzleMode::k64B) {
-      static_assert(step_size == 4 || step_size % 8 == 0, "Unsupported step size");
-      if constexpr (step_size == 4) {
+      static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0, "Unsupported step size");
+      if constexpr (step_size == 2) {
+        // (i/2+1)%4 ^ (i/2)%4 alternates 1/3 every 2 rows.
+        const uint32_t xor_mask = 0x1u | (0x2u * ((row_idx / 2u) % 2u));
+        return (offset ^ xor_mask) + step_size * row_stride;
+      } else if constexpr (step_size == 4) {
         return (offset ^ 0x2) + step_size * row_stride;
       } else {
         // step_size % 8 == 0
@@ -192,11 +208,41 @@ struct smem_t {
     }
   }
 
-  template <typename T = uint32_t>
-  __device__ __forceinline__ void load_fragment(uint32_t offset, T* frag) {
+  // load_fragment: load a single smem fragment into frag[].
+  //   - On CDNA3 (wave64, MFMA): loads 1 uint2 (4 f16) → frag[0..1]
+  //   - On gfx1201 (wave32, WMMA): loads 2 uint2 (8 f16) → frag[0..3]
+  //     NOTE: The smem layout was designed for MFMA; correct WMMA support requires
+  //     a smem layout redesign.  The second uint2 uses the swizzled j+1 offset.
+  //   stride: smem row stride in uint2 units; required for gfx1201 XOR correction.
+  //   col_idx: column index j at call time; needed to recover i%period for XOR.
+  template <uint32_t stride = 0, typename T = uint32_t>
+  __device__ __forceinline__ void load_fragment(uint32_t offset, T* frag,
+                                                uint32_t col_idx = 0) {
 #if defined(PLATFORM_HIP_DEVICE)
     static_assert(sizeof(T) == 4, "Only 32-bit fragment loading supported");
     reinterpret_cast<uint2*>(frag)[0] = *reinterpret_cast<const uint2*>(base + offset);
+#if defined(__gfx1201__)
+    // gfx1201 (RDNA4, wave32): WMMA f16x8 needs 8 f16 = 4 uint32.
+    // Load second uint2 from column-adjacent (j+1) slot in the swizzled smem layout.
+    // For k128B / k128B_16Row: offset(i,j) = i*stride + (j ^ (i%period)).
+    //   lower  = offset & (stride-1)     = j ^ (i%period)
+    //   i_mod  = col_idx ^ lower          recover i%period
+    //   new_lo = (col_idx + 1) ^ i_mod   swizzled lower bits for j+1
+    //   offset2 = (offset & ~mask) | new_lo
+    // This formula is correct for all col_idx and i%period values.
+    // When stride==0, fall back to offset^1 (only safe for even col_idx).
+    if constexpr (stride > 0) {
+      constexpr uint32_t mask = stride - 1u;
+      const uint32_t lower = offset & mask;
+      const uint32_t i_mod = col_idx ^ lower;
+      const uint32_t new_lo = (col_idx + 1u) ^ i_mod;
+      const uint32_t offset2 = (offset & ~mask) | new_lo;
+      reinterpret_cast<uint2*>(frag)[1] = *reinterpret_cast<const uint2*>(base + offset2);
+    } else {
+      // stride unknown: only safe for even col_idx
+      reinterpret_cast<uint2*>(frag)[1] = *reinterpret_cast<const uint2*>(base + (offset ^ 1u));
+    }
+#endif
 #else
     ldmatrix_m8n8x4(offset, frag);
 #endif
@@ -236,9 +282,10 @@ struct smem_t {
    * \param offset The starting offset in shared memory for the quad to begin loading.
    * \param frag A pointer to the thread's local registers to store the resulting column fragment.
    */
-  template <typename T = uint32_t>
-  __device__ __forceinline__ void load_matrix_m16n16_trans(uint32_t offset, T* frag) {
-    load_fragment(offset, frag);
+  template <uint32_t stride = 0, typename T = uint32_t>
+  __device__ __forceinline__ void load_matrix_m16n16_trans(uint32_t offset, T* frag,
+                                                           uint32_t col_idx = 0) {
+    load_fragment<stride>(offset, frag, col_idx);
     gpu_iface::mma::transpose_mma_tile(frag);
   }
 #endif
@@ -247,6 +294,9 @@ struct smem_t {
   __device__ __forceinline__ void store_fragment(uint32_t offset, const T* frag) {
 #if defined(PLATFORM_HIP_DEVICE)
     static_assert(sizeof(T) == 4, "Only 32-bit fragment storing supported");
+    // Always store only the first uint2 (lower 4 f16) to maintain the smem layout.
+    // On gfx1201 the fragment holds 4 uint32 (INT32_ELEMS_PER_THREAD=4) but only the
+    // lower 2 contain valid data for output; the upper 2 are the extra loaded half.
     *reinterpret_cast<uint2*>(base + offset) = reinterpret_cast<const uint2*>(frag)[0];
 #else
     stmatrix_m8n8x4(offset, frag);

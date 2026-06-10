@@ -506,7 +506,6 @@ def _aiter_bootstrap_batch_prefill(
     cu_seqlens_q = torch.tensor([0, seq_q], dtype=torch.int32, device=device)
     kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device=device)
     kv_page_indices = torch.tensor([0], dtype=torch.int32, device=device)
-    kv_last_page_lens = torch.tensor([seq_k], dtype=torch.int32, device=device)
     softmax_scale = head_dim**-0.5
     mha_batch_prefill_func(
         q=q,
@@ -521,7 +520,6 @@ def _aiter_bootstrap_batch_prefill(
         logits_soft_cap=0.5 if has_logits_cap else 0.0,
         causal=causal,
         return_lse=has_lse,
-        kv_last_page_lens=kv_last_page_lens,
     )
 
 
@@ -2279,13 +2277,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
-        if enable_pdl is None:
-            enable_pdl = device_support_pdl(q.device)
-        if enable_pdl:
-            logger.warning(
-                "enable_pdl is not supported in the HIP/ROCm backend and will be ignored. "
-                "This parameter is only effective on CUDA devices with sm_90+."
-            )
+        enable_pdl = False  # not supported on HIP/ROCm; ignore caller value silently
         if self._prefix_len_ptr is not None or self._token_pos_in_items_ptr is not None:
             logger.warning(
                 "Token position tracking features (prefix_len_ptr, token_pos_in_items_ptr) "
