@@ -23,10 +23,27 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <sstream>
 #include <vector>
 
 namespace flashinfer {
+
+inline uint32_t MaybeOverrideFA2PrefillCtaTileQ(uint32_t cta_tile_q) {
+  const char* env = std::getenv("FLASHINFER_FA2_CTA_TILE_Q_OVERRIDE");
+  if (env == nullptr || env[0] == '\0') {
+    return cta_tile_q;
+  }
+  char* end = nullptr;
+  const unsigned long value = std::strtoul(env, &end, 10);
+  if (end == env || *end != '\0') {
+    return cta_tile_q;
+  }
+  if (value == 16 || value == 32 || value == 64 || value == 128) {
+    return static_cast<uint32_t>(value);
+  }
+  return cta_tile_q;
+}
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
@@ -530,7 +547,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     // the CUDA graph is created fixes the maximum number of tokens.
     const uint64_t max_seq_len = total_num_rows - batch_size + 1;
     uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
-    cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
+    cta_tile_q = MaybeOverrideFA2PrefillCtaTileQ(FA2DetermineCtaTileQ(max_qo_len, head_dim));
 
     // Find an upper bound for the number of tiles, derived from the total
     // number of rows and the batch size.  The sum of qo lengths rounded
@@ -543,7 +560,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       sum_packed_qo_len += packed_qo_len_arr[i];
     }
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
+    cta_tile_q = MaybeOverrideFA2PrefillCtaTileQ(FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim));
 
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {

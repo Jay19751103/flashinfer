@@ -210,36 +210,36 @@ __device__ __forceinline__ void transpose_inter_quad_fragments(uint32_t* R) {
 /// @param R Pointer to fragment registers (2 uint32 on CDNA3, 4 uint32 on gfx1201)
 __device__ __forceinline__ void transpose_mma_tile(uint32_t* R) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
-  // WMMA wave32 D→A transpose.
-  // D-matrix: thread t, R[j] (as f16 pair) = {D[j*2+1][(t%16)], D[j*2][(t%16)]} for t/16=0 (even rows)
-  //                                          {D[j*2+1][(t%16)], D[j*2][(t%16)]} for t/16=1 (odd rows)
-  // More precisely: group 0 (t/16=0): s_frag[j] = D[j*2][t%16], packed as R[j/2].{lo,hi}
-  //                 group 1 (t/16=1): s_frag[j] = D[j*2+1][t%16], packed as R[j/2].{lo,hi}
-  //
-  // A-matrix target: group 0 → A[t%16][0..7], group 1 → A[t%16][8..15]
-  //   R_A[i] = { A[t%16][(t/16)*8 + 2i + 1],  A[t%16][(t/16)*8 + 2i] }
-  //
-  // Construction:
-  //   Group 0 uses own R[0..1] (even rows) and partner's R[0..1] (odd rows from g1)
-  //   Group 1 uses partner's R[2..3] (even rows from g0) and own R[2..3] (odd rows)
-  const uint32_t lane_grp = (threadIdx.x % 32) / 16;  // 0 or 1
-  const uint32_t src_idx = lane_grp * 2;               // 0 for g0, 2 for g1
-
-  // Fetch partner's source registers
-  const uint32_t s0 = R[src_idx],      s1 = R[src_idx + 1];
-  const uint32_t p0 = __shfl_xor(s0, 16, 32), p1 = __shfl_xor(s1, 16, 32);
-
-  // even_src = data from group 0 (even D rows), odd_src = data from group 1 (odd D rows)
-  const uint32_t even0 = (lane_grp == 0) ? s0 : p0;
-  const uint32_t odd0  = (lane_grp == 0) ? p0 : s0;
-  const uint32_t even1 = (lane_grp == 0) ? s1 : p1;
-  const uint32_t odd1  = (lane_grp == 0) ? p1 : s1;
-
-  // Interleave even/odd 16-bit halves: R_A[i] = {odd.lo<<16 | even.lo}
-  R[0] = (even0 & 0xFFFFu) | ((odd0 & 0xFFFFu) << 16);
-  R[1] = (even0 >> 16)     | ((odd0 >> 16)      << 16);
-  R[2] = (even1 & 0xFFFFu) | ((odd1 & 0xFFFFu) << 16);
-  R[3] = (even1 >> 16)     | ((odd1 >> 16)      << 16);
+  const uint32_t lane = threadIdx.x % 32;
+  const uint32_t dst_row = lane % 16;
+  const uint32_t dst_k_base = (lane / 16) * 8;
+  const uint32_t src_row_group = dst_row & 1u;
+  const uint32_t src_reg = dst_row >> 1;
+  const uint32_t src_word = src_reg >> 1;
+  const uint32_t src_half = src_reg & 1u;
+  uint32_t out[4];
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (uint32_t h = 0; h < 2; ++h) {
+      const uint32_t dst_k = dst_k_base + i * 2 + h;
+      const uint32_t src_lane = src_row_group * 16 + dst_k;
+      const uint32_t src0 = __shfl(R[0], src_lane, 32);
+      const uint32_t src1 = __shfl(R[1], src_lane, 32);
+      const uint32_t src2 = __shfl(R[2], src_lane, 32);
+      const uint32_t src3 = __shfl(R[3], src_lane, 32);
+      const uint32_t src =
+          (src_word == 0u) ? src0 : ((src_word == 1u) ? src1 : ((src_word == 2u) ? src2 : src3));
+      const uint32_t value = (src_half == 0) ? (src & 0xFFFFu) : (src >> 16);
+      packed |= value << (16 * h);
+    }
+    out[i] = packed;
+  }
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    R[i] = out[i];
+  }
 #else
   transpose_intra_quad_fragments(R);
   transpose_inter_quad_fragments(R);

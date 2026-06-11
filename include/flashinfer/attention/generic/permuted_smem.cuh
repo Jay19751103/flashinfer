@@ -187,8 +187,14 @@ struct smem_t {
           return (offset ^ 0x4u) + step_size * row_stride;
         }
       } else {
-        // step_size % 8 == 0 (e.g. step=16 in the read path)
-        return offset + step_size * row_stride;
+        // step_size % 8 == 0.  For period-16, step=8 still changes the XOR lane
+        // (row 0->8 toggles bit 3); step=16 does not.
+        if constexpr (row_stride >= 16u && (step_size % 16u) != 0u) {
+          const uint32_t xor_mask = ((row_idx + step_size) % 16u) ^ (row_idx % 16u);
+          return (offset ^ xor_mask) + step_size * row_stride;
+        } else {
+          return offset + step_size * row_stride;
+        }
       }
     } else if constexpr (swizzle_mode == SwizzleMode::k64B) {
       static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0, "Unsupported step size");

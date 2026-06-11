@@ -886,6 +886,11 @@ def gen_customize_batch_prefill_module(
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
     }
+    extra_cuda_cflags = []
+    if backend == "fa2" and os.environ.get("FLASHINFER_GFX1201_WMMA_SXV_EXPERIMENT", "0") == "1":
+        uri = f"{uri}_gfx1201_wmma_sxv"
+        extra_cuda_cflags.append("-DFLASHINFER_GFX1201_WMMA_SXV_EXPERIMENT")
+
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
     elif backend == "fa2":
@@ -957,6 +962,7 @@ def gen_customize_batch_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
+            extra_cuda_cflags=extra_cuda_cflags,
         )
     elif backend == "aiter":
         import aiter as _aiter_mod
